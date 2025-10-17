@@ -1,92 +1,290 @@
+# app.py — RAG PDF (FAISS + LangChain OpenAI, citas y controles)
 import os
-import streamlit as st
-from PIL import Image
-from PyPDF2 import PdfReader
-from langchain.text_splitter import CharacterTextSplitter
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.vectorstores import FAISS
-from langchain.llms import OpenAI
-from langchain.chains.question_answering import load_qa_chain
+import io
+import hashlib
 import platform
+from typing import List, Dict, Tuple
 
-# App title and presentation
-st.title('Generación Aumentada por Recuperación (RAG) 💬')
-st.write("Versión de Python:", platform.python_version())
+import streamlit as st
+import pandas as pd
 
-# Load and display image
+# PDF & text
+from pypdf import PdfReader
+
+# LangChain modern imports
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.schema.document import Document
+from langchain.chains import RetrievalQA
+
+# Token length (más realista que len())
 try:
-    image = Image.open('Chat_pdf.png')
-    st.image(image, width=350)
-except Exception as e:
-    st.warning(f"No se pudo cargar la imagen: {e}")
+    import tiktoken
+except Exception:
+    tiktoken = None
 
-# Sidebar information
+# ───────────────────────────────────────────────────────────────
+# CONFIG UI
+# ───────────────────────────────────────────────────────────────
+st.set_page_config(page_title="RAG PDF – FAISS", page_icon="📄", layout="wide")
+st.title("💬 Generación Aumentada por Recuperación (RAG) — PDF → FAISS")
+st.caption(f"Python: **{platform.python_version()}** · LangChain (OpenAI + FAISS)")
+
+# ───────────────────────────────────────────────────────────────
+# UTILIDADES
+# ───────────────────────────────────────────────────────────────
+def file_sha1(file_bytes: bytes) -> str:
+    return hashlib.sha1(file_bytes).hexdigest()
+
+def pdf_to_pages_text(uploaded_file) -> List[Tuple[int, str]]:
+    """Devuelve lista [(page_index_1, text_1), ...]"""
+    reader = PdfReader(uploaded_file)
+    pages = []
+    for i, p in enumerate(reader.pages):
+        try:
+            txt = p.extract_text() or ""
+        except Exception:
+            txt = ""
+        pages.append((i, txt.strip()))
+    return pages
+
+def token_len(s: str) -> int:
+    if not tiktoken:
+        return len(s)
+    enc = tiktoken.get_encoding("cl100k_base")
+    return len(enc.encode(s))
+
+def make_documents(pages: List[Tuple[int, str]], source_name: str) -> List[Document]:
+    docs = []
+    for i, text in pages:
+        if not text:
+            continue
+        meta = {"source": source_name, "page": i + 1}
+        docs.append(Document(page_content=text, metadata=meta))
+    return docs
+
+@st.cache_resource(show_spinner=False)
+def get_embeddings(model_name: str, api_key: str):
+    return OpenAIEmbeddings(model=model_name, api_key=api_key)
+
+@st.cache_resource(show_spinner=False)
+def build_faiss_index(
+    docs: List[Document],
+    embed_model: str,
+    api_key: str,
+    chunk_size: int,
+    chunk_overlap: int,
+):
+    """Chunkea docs y construye FAISS; se cachea por parámetros."""
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        length_function=token_len if tiktoken else len,
+        separators=["\n\n", "\n", " ", ""],
+    )
+    chunks = splitter.split_documents(docs)
+    embeddings = get_embeddings(embed_model, api_key)
+    store = FAISS.from_documents(chunks, embeddings)
+    return store, chunks
+
+def annotate_citations(answer: str, docs: List[Document]) -> str:
+    """Agrega [n] al final y lista de fuentes numeradas."""
+    if not docs:
+        return answer
+    lines = ["", "##### Fuentes:"]
+    for idx, d in enumerate(docs, 1):
+        src = d.metadata.get("source", "PDF")
+        pg = d.metadata.get("page", "?")
+        preview = (d.page_content[:180] + "…") if len(d.page_content) > 180 else d.page_content
+        lines.append(f"[{idx}] {src} — pág. {pg}\n> {preview}")
+    return answer + "\n\n" + "\n\n".join(lines)
+
+def guardrail_strict_mode(retrieved: List[Document], min_chars: int = 120) -> bool:
+    """True si vale la pena responder (hay contexto suficiente)."""
+    joined = " ".join(d.page_content for d in retrieved)
+    return len(joined.strip()) >= min_chars
+
+# ───────────────────────────────────────────────────────────────
+# SIDEBAR — opciones
+# ───────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.subheader("Este Agente te ayudará a realizar análisis sobre el PDF cargado")
+    st.header("⚙️ Configuración")
 
-# Get API key from user
-ke = st.text_input('Ingresa tu Clave de OpenAI', type="password")
-if ke:
-    os.environ['OPENAI_API_KEY'] = ke
+    # API key (st.secrets preferido)
+    api_key = st.text_input("OpenAI API Key", type="password", placeholder="sk-…")
+    if not api_key and "OPENAI_API_KEY" in st.secrets:
+        api_key = st.secrets["OPENAI_API_KEY"]
+
+    st.subheader("Modelos")
+    llm_model = st.selectbox("Modelo LLM", ["gpt-4o", "gpt-4o-mini"], index=1)
+    embed_model = st.selectbox(
+        "Embeddings",
+        ["text-embedding-3-small", "text-embedding-3-large"],
+        index=0,
+        help="small = +rápido / barato; large = +calidad",
+    )
+
+    st.subheader("Chunking")
+    chunk_size = st.slider("Tamaño de chunk", 256, 2000, 900, step=64)
+    chunk_overlap = st.slider("Solapamiento", 0, 400, 120, step=16)
+
+    st.subheader("Búsqueda")
+    k = st.slider("Top-K (documentos)", 1, 12, 4)
+    use_mmr = st.toggle("Usar MMR (diversidad)", value=True)
+    lambda_mult = st.slider("MMR lambda (relevancia↔diversidad)", 0.0, 1.0, 0.5, 0.05, help="Solo aplica si MMR está activo")
+
+    st.subheader("Generación")
+    temperature = st.slider("Temperatura", 0.0, 1.2, 0.1, 0.1)
+    chain_type = st.selectbox("Chain Type", ["stuff", "map_reduce"], index=0)
+    strict_mode = st.toggle("Modo estricto (responder solo con contexto)", value=True)
+
+# ───────────────────────────────────────────────────────────────
+# SUBIDA DE PDF
+# ───────────────────────────────────────────────────────────────
+st.markdown("### 📄 Carga tu PDF")
+uploaded = st.file_uploader("Selecciona un PDF", type=["pdf"])
+
+if uploaded is None:
+    st.info("Sube un PDF para construir el índice y hacer preguntas.")
+    st.stop()
+
+if not api_key:
+    st.warning("Ingresa tu OpenAI API key en la barra lateral.")
+    st.stop()
+
+# ───────────────────────────────────────────────────────────────
+# PROCESAMIENTO DEL PDF → FAISS
+# ───────────────────────────────────────────────────────────────
+file_bytes = uploaded.read()
+source_name = uploaded.name
+file_hash = file_sha1(file_bytes)
+
+with st.spinner("Extrayendo texto del PDF…"):
+    # Importante: usar un nuevo BytesIO porque ya leímos el archivo
+    pages = pdf_to_pages_text(io.BytesIO(file_bytes))
+
+total_chars = sum(len(t) for _, t in pages)
+valid_pages = sum(1 for _, t in pages if t)
+st.success(f"✅ Páginas: {len(pages)} · Páginas con texto: {valid_pages} · Caracteres: {total_chars:,}")
+
+if valid_pages == 0:
+    st.error("No se extrajo texto. Verifica que el PDF no sea escaneado/imagen. (Tip: usa OCR).")
+    st.stop()
+
+docs = make_documents(pages, source_name)
+
+# Cacheo del índice por hash + parámetros clave
+cache_key = (file_hash, embed_model, chunk_size, chunk_overlap)
+@st.cache_resource(show_spinner=False)
+def _cached_build(docs, embed_model, api_key, chunk_size, chunk_overlap):
+    return build_faiss_index(docs, embed_model, api_key, chunk_size, chunk_overlap)
+
+with st.spinner("Construyendo índice FAISS (embeddings)…"):
+    vectordb, chunk_docs = _cached_build(docs, embed_model, api_key, chunk_size, chunk_overlap)
+
+st.success(f"Índice listo con **{len(chunk_docs)}** chunks")
+
+# ───────────────────────────────────────────────────────────────
+# INTERFAZ DE PREGUNTAS
+# ───────────────────────────────────────────────────────────────
+st.markdown("---")
+st.subheader("❓ Pregunta al documento")
+
+qcol, bcol = st.columns([4, 1])
+question = qcol.text_area("Escribe tu pregunta", height=90, placeholder="Ej: ¿Cuál es el objetivo principal del documento?")
+ask = bcol.button("Preguntar", type="primary", use_container_width=True)
+
+# Opciones de recuperación
+if use_mmr:
+    retriever = vectordb.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": k, "fetch_k": max(k * 2, 8), "lambda_mult": lambda_mult},
+    )
 else:
-    st.warning("Por favor ingresa tu clave de API de OpenAI para continuar")
+    retriever = vectordb.as_retriever(search_kwargs={"k": k})
 
-# PDF uploader
-pdf = st.file_uploader("Carga el archivo PDF", type="pdf")
+if ask:
+    if not question.strip():
+        st.warning("Escribe una pregunta.")
+        st.stop()
 
-# Process the PDF if uploaded
-if pdf is not None and ke:
-    try:
-        # Extract text from PDF
-        pdf_reader = PdfReader(pdf)
-        text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text()
-        
-        st.info(f"Texto extraído: {len(text)} caracteres")
-        
-        # Split text into chunks
-        text_splitter = CharacterTextSplitter(
-            separator="\n",
-            chunk_size=500,
-            chunk_overlap=20,
-            length_function=len
+    with st.spinner("Buscando en el índice y generando respuesta…"):
+        llm = ChatOpenAI(
+            model=llm_model,
+            temperature=temperature,
+            api_key=api_key,
         )
-        chunks = text_splitter.split_text(text)
-        st.success(f"Documento dividido en {len(chunks)} fragmentos")
-        
-        # Create embeddings and knowledge base
-        embeddings = OpenAIEmbeddings()
-        knowledge_base = FAISS.from_texts(chunks, embeddings)
-        
-        # User question interface
-        st.subheader("Escribe qué quieres saber sobre el documento")
-        user_question = st.text_area(" ", placeholder="Escribe tu pregunta aquí...")
-        
-        # Process question when submitted
-        if user_question:
-            docs = knowledge_base.similarity_search(user_question)
-            
-            # Use a current model instead of deprecated text-davinci-003
-            # Options: "gpt-3.5-turbo-instruct" or "gpt-4-turbo-preview" depending on your API access
-            llm = OpenAI(temperature=0, model_name="gpt-4o")
-            
-            # Load QA chain
-            chain = load_qa_chain(llm, chain_type="stuff")
-            
-            # Run the chain
-            response = chain.run(input_documents=docs, question=user_question)
-            
-            # Display the response
-            st.markdown("### Respuesta:")
-            st.markdown(response)
-                
-    except Exception as e:
-        st.error(f"Error al procesar el PDF: {str(e)}")
-        # Add detailed error for debugging
-        import traceback
-        st.error(traceback.format_exc())
-elif pdf is not None and not ke:
-    st.warning("Por favor ingresa tu clave de API de OpenAI para continuar")
-else:
-    st.info("Por favor carga un archivo PDF para comenzar")
+
+        # Prompt seguro: cita, no inventes, di “no encontrado” si aplica.
+        system_prompt = (
+            "Eres un asistente que responde únicamente con información del contexto proporcionado. "
+            "Si la respuesta no está en el contexto, responde de forma breve: "
+            "\"No encontré esa información en el documento\". "
+            "Cita páginas al final."
+        )
+
+        # RetrievalQA con retorno de documentos fuente
+        qa = RetrievalQA.from_chain_type(
+            llm=llm,
+            chain_type=chain_type,        # "stuff" (rápido) o "map_reduce" (más extenso)
+            retriever=retriever,
+            return_source_documents=True,
+            chain_type_kwargs={
+                "verbose": False,
+                "prompt": None,   # usa prompt por defecto; podrías inyectar uno con system_prompt si personalizas el Chain
+            },
+        )
+
+        result = qa.invoke({"query": question})
+        answer = result["result"]
+        sources: List[Document] = result.get("source_documents", []) or []
+
+        # Modo estricto: si no hay contexto suficiente, corta
+        if strict_mode and not guardrail_strict_mode(sources):
+            st.warning("No encontré suficiente contexto relevante para responder con confianza.")
+            st.stop()
+
+        # Anotar citas bonitas
+        final = annotate_citations(answer, sources)
+
+    st.markdown("### 🧠 Respuesta")
+    st.write(final)
+
+    with st.expander("📚 Chunks citados (fuentes)"):
+        if sources:
+            rows = []
+            for i, d in enumerate(sources, 1):
+                rows.append({
+                    "#": i,
+                    "página": d.metadata.get("page", "?"),
+                    "caracteres": len(d.page_content),
+                    "preview": (d.page_content[:300] + "…") if len(d.page_content) > 300 else d.page_content
+                })
+            df = pd.DataFrame(rows)
+            st.dataframe(df, hide_index=True, use_container_width=True)
+            st.download_button(
+                "⬇️ Exportar fuentes (CSV)",
+                data=df.to_csv(index=False).encode("utf-8"),
+                file_name="rag_fuentes.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        else:
+            st.info("El chain no devolvió fuentes (revisa parámetros o pregunta distinta).")
+
+# ───────────────────────────────────────────────────────────────
+# EXTRA: Descargas útiles
+# ───────────────────────────────────────────────────────────────
+with st.expander("⬇️ Exportar texto del PDF (limpio)"):
+    all_text = "\n\n".join([f"[Pág. {p}] {t}" for p, t in pages if t])
+    st.download_button(
+        "Descargar .txt",
+        data=all_text.encode("utf-8"),
+        file_name=f"{source_name.rsplit('.',1)[0]}_texto.txt",
+        mime="text/plain",
+        use_container_width=True,
+    )
+
+st.markdown("---")
+st.caption("RAG con FAISS · Embeddings OpenAI v3 · Citas por página · Controles de chunking y búsqueda")
