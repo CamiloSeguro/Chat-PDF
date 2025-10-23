@@ -11,13 +11,12 @@ import pandas as pd
 # PDF & text
 from pypdf import PdfReader
 
-# LangChain modern (v0.2+)
+# LangChain moderno (v0.2+)
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
-from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import (
     create_stuff_documents_chain,
     create_map_reduce_documents_chain,
@@ -170,7 +169,6 @@ source_name = uploaded.name
 file_hash = file_sha1(file_bytes)
 
 with st.spinner("Extrayendo texto del PDF…"):
-    # Importante: usar un nuevo BytesIO porque ya leímos el archivo
     pages = pdf_to_pages_text(io.BytesIO(file_bytes))
 
 total_chars = sum(len(t) for _, t in pages)
@@ -244,13 +242,11 @@ if ask:
         else:
             doc_chain = create_stuff_documents_chain(llm, prompt)
 
-        # Cadena de recuperación
-        chain = create_retrieval_chain(retriever, doc_chain)
+        # 1) Recuperar documentos (sources)
+        sources: List[Document] = retriever.invoke(question)
 
-        # Ejecutar
-        result = chain.invoke({"input": question})
-        answer = result.get("answer", "")
-        sources: List[Document] = result.get("context", []) or []
+        # 2) Generar respuesta con esos documentos
+        answer = doc_chain.invoke({"input": question, "context": sources})
 
         # Modo estricto: si no hay contexto suficiente, corta
         if strict_mode and not guardrail_strict_mode(sources):
@@ -283,7 +279,7 @@ if ask:
                 use_container_width=True,
             )
         else:
-            st.info("La cadena no devolvió fuentes (revisa parámetros o pregunta distinta).")
+            st.info("No se devolvieron fuentes (revisa parámetros o pregunta distinta).")
 
 # ───────────────────────────────────────────────────────────────
 # EXTRA: Descargas útiles
@@ -299,4 +295,4 @@ with st.expander("⬇️ Exportar texto del PDF (limpio)"):
     )
 
 st.markdown("---")
-st.caption("RAG con FAISS · Embeddings OpenAI v3 · Citas por página · Controles de chunking y búsqueda (API moderna LCEL)")
+st.caption("RAG con FAISS · Embeddings OpenAI v3 · Citas por página · Controles de chunking y búsqueda (API moderna LCEL, sin create_retrieval_chain)")
