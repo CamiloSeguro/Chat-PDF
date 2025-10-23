@@ -12,11 +12,12 @@ import pandas as pd
 from pypdf import PdfReader
 
 # LangChain modern imports
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain.schema.document import Document
-from langchain.chains import RetrievalQA
+from langchain_core.documents import Document
+from langchain.chains import RetrievalQA  
+
 
 # Token length (más realista que len())
 try:
