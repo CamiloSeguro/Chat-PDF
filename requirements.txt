@@ -1,8 +1,9 @@
-streamlit
-pypdf
-langchain
-langchain-openai
-langchain-community
-faiss-cpu
-tiktoken
-pandas
+streamlit>=1.37
+pypdf>=4
+tiktoken>=0.7
+langchain>=0.2
+langchain-openai>=0.1
+langchain-community>=0.2
+langchain-text-splitters>=0.2
+faiss-cpu>=1.7
+pandas>=2
