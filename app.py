@@ -1,5 +1,4 @@
-# app.py — RAG PDF (FAISS + LangChain OpenAI, citas y controles)
-import os
+# app.py — RAG PDF (FAISS→Chroma fallback) + LangChain moderno + citas
 import io
 import hashlib
 import platform
@@ -7,20 +6,25 @@ from typing import List, Tuple
 
 import streamlit as st
 import pandas as pd
-
-# PDF & text
 from pypdf import PdfReader
 
 # LangChain moderno (v0.2+)
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.chains.combine_documents import (
     create_stuff_documents_chain,
     create_map_reduce_documents_chain,
 )
+
+# Intentar FAISS; si no existe, usar Chroma
+_USE_FAISS = True
+try:
+    from langchain_community.vectorstores import FAISS
+except Exception:
+    _USE_FAISS = False
+    from langchain_community.vectorstores import Chroma
 
 # Token length (más realista que len())
 try:
@@ -31,9 +35,9 @@ except Exception:
 # ───────────────────────────────────────────────────────────────
 # CONFIG UI
 # ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="RAG PDF – FAISS", page_icon="📄", layout="wide")
-st.title("💬 Generación Aumentada por Recuperación (RAG) — PDF → FAISS")
-st.caption(f"Python: **{platform.python_version()}** · LangChain (OpenAI + FAISS)")
+st.set_page_config(page_title="RAG PDF – FAISS/Chroma", page_icon="📄", layout="wide")
+st.title("💬 RAG — PDF → FAISS (auto-fallback a Chroma)")
+st.caption(f"Python: **{platform.python_version()}** · LangChain (OpenAI + {'FAISS' if _USE_FAISS else 'Chroma'})")
 
 # ───────────────────────────────────────────────────────────────
 # UTILIDADES
@@ -73,14 +77,17 @@ def get_embeddings(model_name: str, api_key: str):
     return OpenAIEmbeddings(model=model_name, api_key=api_key)
 
 @st.cache_resource(show_spinner=False)
-def build_faiss_index(
+def build_vector_store(
     docs: List[Document],
     embed_model: str,
     api_key: str,
     chunk_size: int,
     chunk_overlap: int,
 ):
-    """Chunkea docs y construye FAISS; se cachea por parámetros."""
+    """
+    Chunkea docs y construye FAISS o Chroma (según disponibilidad).
+    Cacheado para evitar recomputar en cada rerun.
+    """
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
@@ -89,8 +96,20 @@ def build_faiss_index(
     )
     chunks = splitter.split_documents(docs)
     embeddings = get_embeddings(embed_model, api_key)
-    store = FAISS.from_documents(chunks, embeddings)
-    return store, chunks
+
+    if _USE_FAISS:
+        store = FAISS.from_documents(chunks, embeddings)
+        store_name = "FAISS"
+    else:
+        # Persistencia liviana en /tmp para Streamlit Cloud
+        store = Chroma.from_documents(
+            documents=chunks,
+            embedding=embeddings,
+            persist_directory="/tmp/chroma_rag_pdf"
+        )
+        store_name = "Chroma"
+
+    return store, chunks, store_name
 
 def annotate_citations(answer: str, docs: List[Document]) -> str:
     """Agrega [n] al final y lista de fuentes numeradas."""
@@ -136,11 +155,7 @@ with st.sidebar:
     st.subheader("Búsqueda")
     k = st.slider("Top-K (documentos)", 1, 12, 4)
     use_mmr = st.toggle("Usar MMR (diversidad)", value=True)
-    lambda_mult = st.slider(
-        "MMR lambda (relevancia↔diversidad)",
-        0.0, 1.0, 0.5, 0.05,
-        help="Solo aplica si MMR está activo"
-    )
+    lambda_mult = st.slider("MMR lambda (relevancia↔diversidad)", 0.0, 1.0, 0.5, 0.05)
 
     st.subheader("Generación")
     temperature = st.slider("Temperatura", 0.0, 1.2, 0.1, 0.1)
@@ -158,11 +173,11 @@ if uploaded is None:
     st.stop()
 
 if not api_key:
-    st.warning("Ingresa tu OpenAI API key en la barra lateral.")
+    st.warning("Ingresa tu OpenAI API key en la barra lateral o en st.secrets.")
     st.stop()
 
 # ───────────────────────────────────────────────────────────────
-# PROCESAMIENTO DEL PDF → FAISS
+# PROCESAMIENTO DEL PDF → VECTOR STORE
 # ───────────────────────────────────────────────────────────────
 file_bytes = uploaded.read()
 source_name = uploaded.name
@@ -182,16 +197,14 @@ if valid_pages == 0:
 docs = make_documents(pages, source_name)
 
 # Cacheo del índice por hash + parámetros clave
-cache_key = (file_hash, embed_model, chunk_size, chunk_overlap)
-
 @st.cache_resource(show_spinner=False)
 def _cached_build(docs, embed_model, api_key, chunk_size, chunk_overlap):
-    return build_faiss_index(docs, embed_model, api_key, chunk_size, chunk_overlap)
+    return build_vector_store(docs, embed_model, api_key, chunk_size, chunk_overlap)
 
-with st.spinner("Construyendo índice FAISS (embeddings)…"):
-    vectordb, chunk_docs = _cached_build(docs, embed_model, api_key, chunk_size, chunk_overlap)
+with st.spinner("Construyendo índice (embeddings)…"):
+    vectordb, chunk_docs, store_name = _cached_build(docs, embed_model, api_key, chunk_size, chunk_overlap)
 
-st.success(f"Índice listo con **{len(chunk_docs)}** chunks")
+st.success(f"Índice **{store_name}** listo con **{len(chunk_docs)}** chunks")
 
 # ───────────────────────────────────────────────────────────────
 # INTERFAZ DE PREGUNTAS
@@ -218,13 +231,8 @@ if ask:
         st.stop()
 
     with st.spinner("Buscando en el índice y generando respuesta…"):
-        llm = ChatOpenAI(
-            model=llm_model,
-            temperature=temperature,
-            api_key=api_key,
-        )
+        llm = ChatOpenAI(model=llm_model, temperature=temperature, api_key=api_key)
 
-        # Prompt seguro (LCEL): contexto + input
         prompt = ChatPromptTemplate.from_messages([
             ("system",
              "Eres un asistente que responde únicamente con información del contexto proporcionado. "
@@ -236,24 +244,23 @@ if ask:
              "Contexto:\n{context}")
         ])
 
-        # Elegir el tipo de combinación de documentos
+        # Cadena de combinación de documentos
         if chain_type == "map_reduce":
             doc_chain = create_map_reduce_documents_chain(llm, prompt)
         else:
             doc_chain = create_stuff_documents_chain(llm, prompt)
 
-        # 1) Recuperar documentos (sources)
+        # 1) Recuperar documentos
         sources: List[Document] = retriever.invoke(question)
 
-        # 2) Generar respuesta con esos documentos
+        # 2) Generar respuesta
         answer = doc_chain.invoke({"input": question, "context": sources})
 
-        # Modo estricto: si no hay contexto suficiente, corta
+        # Guardrail opcional
         if strict_mode and not guardrail_strict_mode(sources):
             st.warning("No encontré suficiente contexto relevante para responder con confianza.")
             st.stop()
 
-        # Anotar citas bonitas
         final = annotate_citations(answer, sources)
 
     st.markdown("### 🧠 Respuesta")
@@ -279,7 +286,7 @@ if ask:
                 use_container_width=True,
             )
         else:
-            st.info("No se devolvieron fuentes (revisa parámetros o pregunta distinta).")
+            st.info("No se devolvieron fuentes (prueba con otra pregunta o ajusta parámetros).")
 
 # ───────────────────────────────────────────────────────────────
 # EXTRA: Descargas útiles
@@ -295,4 +302,4 @@ with st.expander("⬇️ Exportar texto del PDF (limpio)"):
     )
 
 st.markdown("---")
-st.caption("RAG con FAISS · Embeddings OpenAI v3 · Citas por página · Controles de chunking y búsqueda (API moderna LCEL, sin create_retrieval_chain)")
+st.caption("RAG con FAISS (fallback Chroma) · Embeddings OpenAI v3 · Citas por página · Controles de chunking y búsqueda")
