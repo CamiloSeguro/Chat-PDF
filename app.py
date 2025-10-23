@@ -11,13 +11,12 @@ import pandas as pd
 # PDF & text
 from pypdf import PdfReader
 
-# LangChain modern imports
+# LangChain modern (v0.2+)
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
-from langchain.chains import RetrievalQA  
-
+from langchain.chains.retrieval import RetrievalQA  # import actualizado
 
 # Token length (más realista que len())
 try:
@@ -133,7 +132,11 @@ with st.sidebar:
     st.subheader("Búsqueda")
     k = st.slider("Top-K (documentos)", 1, 12, 4)
     use_mmr = st.toggle("Usar MMR (diversidad)", value=True)
-    lambda_mult = st.slider("MMR lambda (relevancia↔diversidad)", 0.0, 1.0, 0.5, 0.05, help="Solo aplica si MMR está activo")
+    lambda_mult = st.slider(
+        "MMR lambda (relevancia↔diversidad)",
+        0.0, 1.0, 0.5, 0.05,
+        help="Solo aplica si MMR está activo"
+    )
 
     st.subheader("Generación")
     temperature = st.slider("Temperatura", 0.0, 1.2, 0.1, 0.1)
@@ -177,6 +180,7 @@ docs = make_documents(pages, source_name)
 
 # Cacheo del índice por hash + parámetros clave
 cache_key = (file_hash, embed_model, chunk_size, chunk_overlap)
+
 @st.cache_resource(show_spinner=False)
 def _cached_build(docs, embed_model, api_key, chunk_size, chunk_overlap):
     return build_faiss_index(docs, embed_model, api_key, chunk_size, chunk_overlap)
@@ -233,7 +237,7 @@ if ask:
             return_source_documents=True,
             chain_type_kwargs={
                 "verbose": False,
-                "prompt": None,   # usa prompt por defecto; podrías inyectar uno con system_prompt si personalizas el Chain
+                "prompt": None,   # podrías inyectar un prompt personalizado si lo deseas
             },
         )
 
