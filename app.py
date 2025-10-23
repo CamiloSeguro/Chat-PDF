@@ -3,7 +3,7 @@ import os
 import io
 import hashlib
 import platform
-from typing import List, Dict, Tuple
+from typing import List, Tuple
 
 import streamlit as st
 import pandas as pd
@@ -16,7 +16,12 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
-from langchain.chains.retrieval import RetrievalQA  # import actualizado
+from langchain_core.prompts import ChatPromptTemplate
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import (
+    create_stuff_documents_chain,
+    create_map_reduce_documents_chain,
+)
 
 # Token length (más realista que len())
 try:
@@ -221,29 +226,31 @@ if ask:
             api_key=api_key,
         )
 
-        # Prompt seguro: cita, no inventes, di “no encontrado” si aplica.
-        system_prompt = (
-            "Eres un asistente que responde únicamente con información del contexto proporcionado. "
-            "Si la respuesta no está en el contexto, responde de forma breve: "
-            "\"No encontré esa información en el documento\". "
-            "Cita páginas al final."
-        )
+        # Prompt seguro (LCEL): contexto + input
+        prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             "Eres un asistente que responde únicamente con información del contexto proporcionado. "
+             "Si la respuesta no está en el contexto, responde de forma breve: "
+             "\"No encontré esa información en el documento\". "
+             "Cita páginas al final."),
+            ("human",
+             "Pregunta: {input}\n\n"
+             "Contexto:\n{context}")
+        ])
 
-        # RetrievalQA con retorno de documentos fuente
-        qa = RetrievalQA.from_chain_type(
-            llm=llm,
-            chain_type=chain_type,        # "stuff" (rápido) o "map_reduce" (más extenso)
-            retriever=retriever,
-            return_source_documents=True,
-            chain_type_kwargs={
-                "verbose": False,
-                "prompt": None,   # podrías inyectar un prompt personalizado si lo deseas
-            },
-        )
+        # Elegir el tipo de combinación de documentos
+        if chain_type == "map_reduce":
+            doc_chain = create_map_reduce_documents_chain(llm, prompt)
+        else:
+            doc_chain = create_stuff_documents_chain(llm, prompt)
 
-        result = qa.invoke({"query": question})
-        answer = result["result"]
-        sources: List[Document] = result.get("source_documents", []) or []
+        # Cadena de recuperación
+        chain = create_retrieval_chain(retriever, doc_chain)
+
+        # Ejecutar
+        result = chain.invoke({"input": question})
+        answer = result.get("answer", "")
+        sources: List[Document] = result.get("context", []) or []
 
         # Modo estricto: si no hay contexto suficiente, corta
         if strict_mode and not guardrail_strict_mode(sources):
@@ -276,7 +283,7 @@ if ask:
                 use_container_width=True,
             )
         else:
-            st.info("El chain no devolvió fuentes (revisa parámetros o pregunta distinta).")
+            st.info("La cadena no devolvió fuentes (revisa parámetros o pregunta distinta).")
 
 # ───────────────────────────────────────────────────────────────
 # EXTRA: Descargas útiles
@@ -292,4 +299,4 @@ with st.expander("⬇️ Exportar texto del PDF (limpio)"):
     )
 
 st.markdown("---")
-st.caption("RAG con FAISS · Embeddings OpenAI v3 · Citas por página · Controles de chunking y búsqueda")
+st.caption("RAG con FAISS · Embeddings OpenAI v3 · Citas por página · Controles de chunking y búsqueda (API moderna LCEL)")
