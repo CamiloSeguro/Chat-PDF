@@ -1,4 +1,4 @@
-# app.py — RAG PDF (FAISS→Chroma fallback) + LangChain moderno + citas
+# app.py — RAG PDF (FAISS→Chroma fallback) sin langchain.chains.*, compatible Streamlit Cloud
 import io
 import hashlib
 import platform
@@ -13,12 +13,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
-from langchain.chains.combine_documents import (
-    create_stuff_documents_chain,
-    create_map_reduce_documents_chain,
-)
 
-# Intentar FAISS; si no existe, usar Chroma
+# Intentar FAISS; si no existe, usar Chroma (para Streamlit Cloud)
 _USE_FAISS = True
 try:
     from langchain_community.vectorstores import FAISS
@@ -37,7 +33,7 @@ except Exception:
 # ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="RAG PDF – FAISS/Chroma", page_icon="📄", layout="wide")
 st.title("💬 RAG — PDF → FAISS (auto-fallback a Chroma)")
-st.caption(f"Python: **{platform.python_version()}** · LangChain (OpenAI + {'FAISS' if _USE_FAISS else 'Chroma'})")
+st.caption(f"Python: **{platform.python_version()}** · Vector store: **{'FAISS' if _USE_FAISS else 'Chroma'}**")
 
 # ───────────────────────────────────────────────────────────────
 # UTILIDADES
@@ -127,6 +123,20 @@ def guardrail_strict_mode(retrieved: List[Document], min_chars: int = 120) -> bo
     """True si vale la pena responder (hay contexto suficiente)."""
     joined = " ".join(d.page_content for d in retrieved)
     return len(joined.strip()) >= min_chars
+
+def docs_to_context(docs: List[Document], max_chars: int = 6000) -> str:
+    """Concatena documentos con límite de caracteres para no reventar el contexto."""
+    parts = []
+    total = 0
+    for d in docs:
+        snippet = d.page_content
+        if total + len(snippet) > max_chars:
+            snippet = snippet[: max(0, max_chars - total)]
+        parts.append(f"[pág. {d.metadata.get('page','?')}] {snippet}")
+        total += len(snippet)
+        if total >= max_chars:
+            break
+    return "\n\n".join(parts)
 
 # ───────────────────────────────────────────────────────────────
 # SIDEBAR — opciones
@@ -233,35 +243,69 @@ if ask:
     with st.spinner("Buscando en el índice y generando respuesta…"):
         llm = ChatOpenAI(model=llm_model, temperature=temperature, api_key=api_key)
 
-        prompt = ChatPromptTemplate.from_messages([
-            ("system",
-             "Eres un asistente que responde únicamente con información del contexto proporcionado. "
-             "Si la respuesta no está en el contexto, responde de forma breve: "
-             "\"No encontré esa información en el documento\". "
-             "Cita páginas al final."),
-            ("human",
-             "Pregunta: {input}\n\n"
-             "Contexto:\n{context}")
-        ])
-
-        # Cadena de combinación de documentos
-        if chain_type == "map_reduce":
-            doc_chain = create_map_reduce_documents_chain(llm, prompt)
-        else:
-            doc_chain = create_stuff_documents_chain(llm, prompt)
-
         # 1) Recuperar documentos
         sources: List[Document] = retriever.invoke(question)
-
-        # 2) Generar respuesta
-        answer = doc_chain.invoke({"input": question, "context": sources})
 
         # Guardrail opcional
         if strict_mode and not guardrail_strict_mode(sources):
             st.warning("No encontré suficiente contexto relevante para responder con confianza.")
             st.stop()
 
-        final = annotate_citations(answer, sources)
+        # 2) Generación según chain_type (sin imports de chains)
+        if chain_type == "map_reduce":
+            # MAP: resumen/nota por documento
+            map_prompt = ChatPromptTemplate.from_messages([
+                ("system",
+                 "Eres un asistente que solo usa el contexto del documento para responder. "
+                 "Extrae información relevante como notas claras. Si no hay respuesta, di: "
+                 "\"No encontré esa información en el documento\"."),
+                ("human",
+                 "Pregunta: {question}\n\nDocumento (pág. {page}):\n{doc}")
+            ])
+            notes = []
+            for d in sources:
+                note = llm.invoke(map_prompt.format_messages(
+                    question=question,
+                    page=d.metadata.get("page", "?"),
+                    doc=d.page_content
+                ))
+                notes.append(note.content.strip())
+
+            # REDUCE: síntesis de las notas
+            reduce_prompt = ChatPromptTemplate.from_messages([
+                ("system",
+                 "Sintetiza las notas de documentos para responder la pregunta. "
+                 "Usa solo la información de las notas. "
+                 "Si no hay información suficiente, responde: "
+                 "\"No encontré esa información en el documento\". "
+                 "Agrega citas de páginas al final (ej: [pág. 3, 5])."),
+                ("human",
+                 "Pregunta: {question}\n\nNotas:\n{notes}")
+            ])
+            answer_msg = llm.invoke(reduce_prompt.format_messages(
+                question=question,
+                notes="\n\n".join(f"- {n}" for n in notes) if notes else "(sin notas)"
+            ))
+            answer_text = answer_msg.content.strip()
+        else:
+            # STUFF: concatenar contexto y responder
+            stuff_prompt = ChatPromptTemplate.from_messages([
+                ("system",
+                 "Eres un asistente que responde únicamente con información del contexto proporcionado. "
+                 "Si la respuesta no está en el contexto, responde: "
+                 "\"No encontré esa información en el documento\". "
+                 "Agrega citas de páginas al final."),
+                ("human",
+                 "Pregunta: {question}\n\nContexto:\n{context}")
+            ])
+            context_text = docs_to_context(sources, max_chars=6000)
+            answer_msg = llm.invoke(stuff_prompt.format_messages(
+                question=question,
+                context=context_text or "(sin contexto)"
+            ))
+            answer_text = answer_msg.content.strip()
+
+        final = annotate_citations(answer_text, sources)
 
     st.markdown("### 🧠 Respuesta")
     st.write(final)
@@ -302,4 +346,4 @@ with st.expander("⬇️ Exportar texto del PDF (limpio)"):
     )
 
 st.markdown("---")
-st.caption("RAG con FAISS (fallback Chroma) · Embeddings OpenAI v3 · Citas por página · Controles de chunking y búsqueda")
+st.caption("RAG con FAISS (fallback Chroma) · Embeddings OpenAI v3 · Citas por página · Controles de chunking y búsqueda (sin langchain.chains)")
